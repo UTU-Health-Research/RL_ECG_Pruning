@@ -1,0 +1,468 @@
+import copy
+import math
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+
+from src.modeling.metrics import cal_multilabel_metrics
+from env.amc_export_utils import export_pruned_model
+
+
+class ChannelPruningEnv:
+    """
+
+    Search-time pruning:
+        - pseudo-pruning with reconstruction during the episode
+
+    Episode-end reward:
+        - build the REAL structurally pruned model
+        - validate that exported model
+        - use that validation AUROC as reward
+
+    """
+
+    def __init__(self, model, checkpoint, train_loader, val_loader,
+                 preserve_ratio, args, labels):
+
+        self.model = model
+        self.checkpoint = copy.deepcopy(checkpoint)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.labels = labels
+        self.args = args
+
+        self.device = next(self.model.parameters()).device
+
+        self.lbound = args.lbound
+        self.rbound = args.rbound
+        self.preserve_ratio = preserve_ratio
+
+        self.n_calibration_batches = getattr(args, "n_calibration_batches", 5)
+        self.n_points_per_layer = getattr(args, "n_points_per_layer", 50)
+        self.channel_round = getattr(args, "channel_round", 1)
+
+        self._build_residual_dependency()
+        self._build_index()
+        self._extract_features()
+        self._build_state_embedding()
+
+        self.org_flops = self._compute_original_flops()
+        self.expected_preserve_computation = self.preserve_ratio * self.org_flops
+
+        self.best_reward = -math.inf
+        self.best_strategy = None
+        self.best_info = None
+        self.best_exported_model_path = None
+
+        self.reset()
+
+    def _build_residual_dependency(self):
+        self.shared_idx = {}
+
+        residual_groups = [
+            [29, 41],
+            [53, 65, 77],
+            [89, 101, 113, 125],
+            [137, 149, 161],
+            [173, 185, 197],
+        ]
+
+        for group in residual_groups:
+            for idx in group:
+                self.shared_idx[idx] = group
+
+    @staticmethod
+    def _conv1d_out_length(L_in, kernel_size, stride, padding, dilation=1):
+        return int(np.floor((L_in + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1))
+
+    def _build_index(self):
+        self.prunable_idx = []
+        self.prunable_ops = []
+        self.buffer_dict = {}
+        self.layer_info_meta = {}
+        self.all_prunable_for_features = []
+        self.all_prunable_idx = []
+
+        self.strategy_dict = {}
+        self.layer_flops_dict = {}
+        self.buffer_flops_dict = {}
+        self.org_channels = []
+
+        modules = list(self.model.modules())
+
+        current_length = 4096
+        this_buffer_list = []
+        visited = set()
+
+        for i, m in enumerate(modules):
+            if not isinstance(m, nn.Conv1d):
+                continue
+
+            out_length = self._conv1d_out_length(
+                current_length, m.kernel_size[0], m.stride[0], m.padding[0], m.dilation[0]
+            )
+
+            is_depthwise = (m.groups == m.in_channels)
+
+            self.layer_info_meta[i] = {
+                "in_channels": m.in_channels,
+                "out_channels": m.out_channels,
+                "kernel_size": m.kernel_size[0],
+                "stride": m.stride[0],
+                "padding": m.padding[0],
+                "dilation": m.dilation[0],
+                "out_length": out_length,
+                "is_depthwise": is_depthwise,
+            }
+
+            flops = float(m.in_channels * m.out_channels * m.kernel_size[0] * out_length)
+            self.layer_flops_dict[i] = flops
+
+            if is_depthwise:
+                this_buffer_list.append(i)
+            else:
+                self.all_prunable_for_features.append(i)
+                self.all_prunable_idx.append(i)
+
+                if i not in visited:
+                    self.prunable_idx.append(i)
+                    self.prunable_ops.append(m)
+                    self.buffer_dict[i] = this_buffer_list.copy()
+                    self.buffer_flops_dict[i] = sum(self.layer_flops_dict[b] for b in this_buffer_list)
+                    this_buffer_list = []
+
+                    self.org_channels.append(m.in_channels)
+                    self.strategy_dict[i] = [self.lbound, self.lbound]
+
+                    if i in self.shared_idx:
+                        for g in self.shared_idx[i]:
+                            visited.add(g)
+
+            current_length = out_length
+
+        self.strategy_dict[self.prunable_idx[0]][0] = 1.0
+        self.strategy_dict[self.prunable_idx[-1]][1] = 1.0
+        self.min_strategy_dict = copy.deepcopy(self.strategy_dict)
+
+    def _compute_original_flops(self):
+        total = 0.0
+        for idx in self.prunable_idx:
+            total += self.layer_flops_dict[idx]
+            total += self.buffer_flops_dict[idx]
+        return total
+
+    def _extract_features(self):
+        self.layer_info = {}
+        modules = list(self.model.modules())
+        hooks = []
+
+        def hook_fn(module, inp, out):
+            module.input_feat = inp[0].detach().cpu().numpy()
+            module.output_feat = out.detach().cpu().numpy()
+
+        for idx in self.all_prunable_for_features:
+            hooks.append(modules[idx].register_forward_hook(hook_fn))
+
+        self.model.eval()
+
+        with torch.no_grad():
+            for batch_i, (ecg, ag, _) in enumerate(self.train_loader):
+                if batch_i >= self.n_calibration_batches:
+                    break
+
+                ecg = ecg.to(self.device, non_blocking=True)
+                ag = ag.to(self.device, non_blocking=True)
+
+                _ = self.model(ecg, ag)
+
+                for idx in self.all_prunable_for_features:
+                    m = modules[idx]
+                    xin = m.input_feat
+                    xout = m.output_feat
+
+                    n_points = min(self.n_points_per_layer, max(1, xout.shape[2]))
+
+                    if xin.shape[2] == xout.shape[2]:
+                        rand_out_idx = np.random.randint(0, xout.shape[2], n_points)
+                        rand_in_idx = rand_out_idx
+                    else:
+                        rand_out_idx = np.random.randint(0, xout.shape[2], n_points)
+                        stride = m.stride[0]
+                        padding = m.padding[0]
+                        rand_in_idx = rand_out_idx * stride - padding
+                        rand_in_idx = np.clip(rand_in_idx, 0, xin.shape[2] - 1)
+
+                    xin_sampled = xin[:, :, rand_in_idx].transpose(0, 2, 1).reshape(-1, xin.shape[1])
+                    xout_sampled = xout[:, :, rand_out_idx].transpose(0, 2, 1).reshape(-1, xout.shape[1])
+
+                    if idx not in self.layer_info:
+                        self.layer_info[idx] = {"X": xin_sampled, "Y": xout_sampled}
+                    else:
+                        self.layer_info[idx]["X"] = np.vstack([self.layer_info[idx]["X"], xin_sampled])
+                        self.layer_info[idx]["Y"] = np.vstack([self.layer_info[idx]["Y"], xout_sampled])
+
+        for h in hooks:
+            h.remove()
+
+    def _build_state_embedding(self):
+        layer_embedding = []
+
+        for i, idx in enumerate(self.prunable_idx):
+            meta = self.layer_info_meta[idx]
+            this_state = [
+                i,
+                0,
+                meta["in_channels"],
+                meta["out_channels"],
+                meta["stride"],
+                meta["kernel_size"],
+                self.layer_flops_dict[idx],
+                0.0,
+                0.0,
+                1.0
+            ]
+            layer_embedding.append(np.array(this_state, dtype=np.float32))
+
+        layer_embedding = np.array(layer_embedding, dtype=np.float32)
+
+        for j in range(layer_embedding.shape[1]):
+            fmin = layer_embedding[:, j].min()
+            fmax = layer_embedding[:, j].max()
+            if fmax - fmin > 0:
+                layer_embedding[:, j] = (layer_embedding[:, j] - fmin) / (fmax - fmin)
+
+        self.layer_embedding = layer_embedding
+
+    def reset(self):
+        self.model.load_state_dict(self.checkpoint)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.cur_ind = 0
+        self.strategy = []
+        self.strategy_dict = copy.deepcopy(self.min_strategy_dict)
+
+        self.layer_embedding[:, -1] = 1.0
+        self.layer_embedding[:, -2] = 0.0
+        self.layer_embedding[:, -3] = 0.0
+
+        self.visited = [False] * len(self.prunable_idx)
+        self.index_buffer = {}
+
+        return self.layer_embedding[0].copy()
+
+    def _get_buffer_flops(self, idx):
+        return self.buffer_flops_dict[idx]
+
+    def _cur_flops(self):
+        flops = 0.0
+        for idx in self.prunable_idx:
+            c_in_ratio, c_out_ratio = self.strategy_dict[idx]
+            flops += self.layer_flops_dict[idx] * c_in_ratio * c_out_ratio
+            flops += self._get_buffer_flops(idx) * c_in_ratio
+        return flops
+
+    def _cur_reduced(self):
+        return self.org_flops - self._cur_flops()
+
+    def _action_wall(self, action):
+        action = np.asarray(action).reshape(-1)[0]
+        action = float(np.clip(action, 0.0, 1.0))
+
+        other_comp = 0.0
+        this_comp = 0.0
+
+        for i, idx in enumerate(self.prunable_idx):
+            flop = self.layer_flops_dict[idx]
+            buffer_flop = self._get_buffer_flops(idx)
+
+            if i == self.cur_ind - 1:
+                this_comp += flop * self.strategy_dict[idx][0]
+                other_comp += buffer_flop * self.strategy_dict[idx][0]
+
+            elif i == self.cur_ind:
+                this_comp += flop * self.strategy_dict[idx][1]
+                this_comp += buffer_flop
+
+            else:
+                other_comp += flop * self.strategy_dict[idx][0] * self.strategy_dict[idx][1]
+                other_comp += buffer_flop * self.strategy_dict[idx][0]
+
+        max_preserve_ratio = (self.expected_preserve_computation - other_comp) / max(this_comp, 1e-12)
+        action = min(action, max_preserve_ratio)
+        action = max(action, self.strategy_dict[self.prunable_idx[self.cur_ind]][0])
+        action = float(np.clip(action, self.lbound, self.rbound))
+        return action
+
+    def _pseudo_prune_with_reconstruction(self, idx, ratio, preserve_idx=None):
+        modules = list(self.model.modules())
+        m = modules[idx]
+
+        W = m.weight.data.detach().cpu().numpy()
+        c_in = W.shape[1]
+
+        def format_keep(x):
+            k = max(1, int(round(x)))
+            if self.channel_round > 1:
+                k = int(np.ceil(k / self.channel_round) * self.channel_round)
+                k = min(k, c_in)
+            return k
+
+        keep = format_keep(c_in * ratio)
+
+        if preserve_idx is None:
+            importance = np.abs(W).sum(axis=(0, 2))
+            preserve_idx = np.argsort(-importance)[:keep]
+            preserve_idx = np.sort(preserve_idx)
+
+        mask = np.zeros(c_in, dtype=bool)
+        mask[preserve_idx] = True
+
+        X = self.layer_info[idx]["X"]
+        Y = self.layer_info[idx]["Y"]
+        X_masked = X[:, mask]
+
+        try:
+            B, _, _, _ = np.linalg.lstsq(X_masked, Y, rcond=None)
+        except np.linalg.LinAlgError:
+            B = None
+
+        new_weight = np.zeros_like(W)
+
+        if B is not None:
+            center = W.shape[2] // 2
+            new_weight[:, mask, center] = B.T
+        else:
+            new_weight[:, mask, :] = W[:, mask, :]
+
+        m.weight.data = torch.from_numpy(new_weight).to(self.device)
+        if m.bias is not None:
+            m.bias.data = m.bias.data.to(self.device)
+
+        real_ratio = float(mask.sum() / len(mask))
+        return real_ratio, preserve_idx
+
+    def _strategy_key(self, idx):
+        if idx in self.shared_idx:
+            return min(self.shared_idx[idx])
+        return idx
+
+    def _validate(self):
+        return self._validate_given_model(self.model)
+
+    def _validate_given_model(self, model):
+        model.eval()
+
+        labels_all = torch.empty((0, len(self.labels)), device=self.device)
+        preds_all = torch.empty((0, len(self.labels)), device=self.device)
+
+        sigmoid = torch.nn.Sigmoid().to(self.device)
+
+        with torch.no_grad():
+            for ecg, ag, labels in self.val_loader:
+                ecg = ecg.to(self.device, non_blocking=True)
+                ag = ag.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+
+                logits = model(ecg, ag)
+                probs = sigmoid(logits)
+
+                labels_all = torch.cat((labels_all, labels), dim=0)
+                preds_all = torch.cat((preds_all, probs), dim=0)
+
+        _, _, _, micro_auroc = cal_multilabel_metrics(
+            labels_all, preds_all, self.labels, threshold=0.5
+        )
+        return float(micro_auroc)
+
+    def _build_real_model_from_strategy(self, strategy):
+        base_model = copy.deepcopy(self.model)
+        base_model.load_state_dict(self.checkpoint)
+        base_model.to(self.device)
+        base_model.eval()
+
+        real_model = export_pruned_model(
+            model=base_model,
+            rep_strategy=strategy,
+            channel_round=self.channel_round
+        )
+        real_model.to(self.device)
+        real_model.eval()
+        return real_model
+
+    def step(self, action):
+        idx = self.prunable_idx[self.cur_ind]
+
+        if self.visited[self.cur_ind]:
+            action = self.strategy_dict[idx][0]
+            preserve_idx = self.index_buffer[self.cur_ind]
+        else:
+            action = self._action_wall(action)
+            preserve_idx = None
+
+        real_ratio, preserve_idx = self._pseudo_prune_with_reconstruction(idx, action, preserve_idx)
+
+        if not self.visited[self.cur_ind]:
+            for group in set(tuple(v) for v in self.shared_idx.values()):
+                if idx in group:
+                    for g_idx in group:
+                        if g_idx in self.prunable_idx:
+                            pos = self.prunable_idx.index(g_idx)
+                            self.visited[pos] = True
+                            self.index_buffer[pos] = preserve_idx.copy()
+                            self.strategy_dict[g_idx][0] = real_ratio
+
+        self.strategy.append(real_ratio)
+        self.strategy_dict[self._strategy_key(idx)][0] = real_ratio
+
+        if self.cur_ind > 0:
+            prev_idx = self.prunable_idx[self.cur_ind - 1]
+            self.strategy_dict[self._strategy_key(prev_idx)][1] = real_ratio
+
+        done = (self.cur_ind == len(self.prunable_idx) - 1)
+
+        if done:
+            flops_ratio = self._cur_flops() / max(self.org_flops, 1e-12)
+
+            # REAL exported model reward
+            real_model = self._build_real_model_from_strategy(self.strategy.copy())
+            acc = self._validate_given_model(real_model)
+
+            beta = 1.0
+            reward = float(acc - beta * abs(flops_ratio - self.preserve_ratio))
+
+            info = {
+                "acc": float(acc),
+                "flops_ratio": float(flops_ratio),
+                "strategy": self.strategy.copy(),
+            }
+
+            if reward > self.best_reward:
+                self.best_reward = reward
+                self.best_strategy = self.strategy.copy()
+                self.best_info = info.copy()
+
+                save_dir = os.path.join(".", "experiments", "mobilenetV2", "pruned_models")
+                os.makedirs(save_dir, exist_ok=True)
+
+                best_model_path = os.path.join(save_dir, "best_real_model_during_search.pt")
+                torch.save(real_model, best_model_path)
+                self.best_exported_model_path = best_model_path
+
+                np.save("best_strategy.npy", np.array(self.best_strategy, dtype=np.float32))
+
+            return None, reward, True, info
+
+        self.visited[self.cur_ind] = True
+        self.cur_ind += 1
+
+        self.layer_embedding[self.cur_ind][-3] = self._cur_reduced() / max(self.org_flops, 1e-12)
+        self.layer_embedding[self.cur_ind][-2] = sum(
+            self.layer_flops_dict[idx_] + self._get_buffer_flops(idx_)
+            for idx_ in self.prunable_idx[self.cur_ind + 1:]
+        ) / max(self.org_flops, 1e-12)
+        self.layer_embedding[self.cur_ind][-1] = real_ratio
+
+        obs = self.layer_embedding[self.cur_ind].copy()
+        return obs, 0.0, False, None
