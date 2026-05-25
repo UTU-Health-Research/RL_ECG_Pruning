@@ -39,21 +39,17 @@ Reinforcement learning based structural channel pruning for lightweight multi-la
 ```text
 RL_ECG_Pruning/
 │
-├── mobilenetv2_search.py          # RL pruning search
-├── test_pruned_model.py           # Export structurally pruned model
-├── fine_tune.py                   # Fine-tune pruned model
+├── mobilenetv2_search.py          # RL pruning search        
 ├── env/
 │   ├── ecg_channel_pruning_env.py
-│   └── rewards.py
 ├── lib/
 │   ├── agent.py                   # DDPG agent
 │   ├── memory.py                  # Replay buffer
 │   └── utils.py
 ├── scripts/
 │   ├── run_search.sh
-│   └── 
 ├── src/
-│   ├── modeling/models/
+│   ├── modeling/models/mobilenetv2.py
 │   └── dataloader/
 └── README.md
 ```
