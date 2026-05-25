@@ -1,0 +1,192 @@
+import os
+import random
+import argparse
+import numpy as np
+import torch
+
+from torch.utils.data import DataLoader
+
+from env.mobilenetv2_env import ChannelPruningEnv
+from lib.agent import DDPG
+from src.dataloader.dataset import ECGDataset, get_transforms
+
+
+def set_seed(seed=321):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--val_path", type=str, required=True)
+    parser.add_argument("--ckpt_path", type=str, required=True)
+
+    parser.add_argument("--preserve_ratio", type=float, default=0.1)
+    parser.add_argument("--max_episodes", type=int, default=3)
+    parser.add_argument("--lbound", type=float, default=0.05)
+    parser.add_argument("--rbound", type=float, default=1.0)
+
+    parser.add_argument("--labels", nargs="+", required=True)
+
+    # env / feature extraction
+    parser.add_argument("--n_calibration_batches", type=int, default=5)
+    parser.add_argument("--n_points_per_layer", type=int, default=50)
+    parser.add_argument("--channel_round", type=int, default=1)
+    parser.add_argument("--reward_alpha", type=float, default=0.5)
+
+    # ddpg params (must match lib/agent.py expectations)
+    parser.add_argument("--hidden1", type=int, default=300)
+    parser.add_argument("--hidden2", type=int, default=300)
+    parser.add_argument("--lr_c", type=float, default=1e-3)
+    parser.add_argument("--lr_a", type=float, default=1e-4)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--discount", type=float, default=1.0)
+    parser.add_argument("--bsize", type=int, default=64)
+    parser.add_argument("--rmsize", type=int, default=100)
+    parser.add_argument("--window_length", type=int, default=1)
+    parser.add_argument("--tau", type=float, default=0.01)
+    parser.add_argument("--init_delta", type=float, default=0.5)
+    parser.add_argument("--delta_decay", type=float, default=0.95)
+    parser.add_argument("--epsilon", type=int, default=50000)
+
+    # dataloader
+    parser.add_argument("--train_batch_size", type=int, default=32)
+    parser.add_argument("--val_batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+
+    return parser.parse_args()
+
+
+def main(args):
+    set_seed(321)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---------------- DATA ----------------
+    train_set = ECGDataset(args.train_path, get_transforms("train"))
+    val_set = ECGDataset(args.val_path, get_transforms("val"))
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    # ---------------- MODEL ----------------
+    from src.modeling.models.mobilenetv2 import mobilenetv2_1d
+
+    model = mobilenetv2_1d(
+        input_channels=12,
+        num_classes=len(args.labels),
+        ag_dim=3
+    ).to(device)
+
+    checkpoint = torch.load(args.ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint)
+
+    # ---------------- ENV ----------------
+    env = ChannelPruningEnv(
+        model=model,
+        checkpoint=checkpoint,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        preserve_ratio=args.preserve_ratio,
+        args=args,
+        labels=args.labels
+    )
+
+    # ---------------- AGENT ----------------
+    nb_states = env.layer_embedding.shape[1]
+    nb_actions = 1
+
+    # AMC multiplies replay memory by number of layers
+    args.rmsize = args.rmsize * len(env.prunable_idx)
+
+    agent = DDPG(nb_states, nb_actions, args)
+    agent.is_training = True
+
+    best_reward = -np.inf
+    best_strategy = None
+
+    # ---------------- SEARCH LOOP ----------------
+    for episode in range(args.max_episodes):
+        state = env.reset()
+        agent.reset(state)
+
+        episode_reward = 0.0
+        trajectory = []
+
+        done = False
+        while not done:
+            if episode <= args.warmup:
+                action = agent.random_action()
+            else:
+                action = agent.select_action(state, episode=episode)
+
+            next_state, reward, done, info = env.step(action)
+
+            if next_state is None:
+                next_state_for_memory = np.zeros_like(state, dtype=np.float32)
+            else:
+                next_state_for_memory = next_state
+
+            trajectory.append([
+                reward,
+                np.array(state, dtype=np.float32),
+                np.array(next_state_for_memory, dtype=np.float32),
+                np.array(action, dtype=np.float32),
+                done
+            ])
+
+            state = next_state_for_memory
+            episode_reward += reward
+
+        final_reward = trajectory[-1][0]
+
+        for r_t, s_t, s_t1, a_t, d_t in trajectory:
+            agent.observe(final_reward, s_t, s_t1, a_t, d_t)
+
+            if episode > args.warmup and len(agent.memory.observations) >= args.bsize:
+                agent.update_policy()
+
+        print(
+            f"Episode {episode}: "
+            f"episode_reward={episode_reward:.6f}, "
+            f"final_reward={final_reward:.6f}, "
+            f"acc={info['acc']:.6f}, "
+            f"flops_ratio={info['flops_ratio']:.6f}"
+        )
+
+        if final_reward > best_reward:
+            best_reward = final_reward
+            best_strategy = info["strategy"]
+
+            np.save("best_strategy.npy", np.array(best_strategy, dtype=np.float32))
+            print(f"New best strategy saved. Reward={best_reward:.6f}")
+
+    print("Search Finished")
+    print("Best reward:", best_reward)
+    print("Best strategy:", best_strategy)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
