@@ -2,7 +2,7 @@
 set -e
 
 echo "Starting AMC ECG pruning..."
-# bash scripts/run_amc_mobilenetv2_v3.sh
+# bash scripts/run_search_mobilenetv2.sh
 # source ~/anaconda3/bin/activate your_env
 
 TRAIN_PATH="./data/split_csvs/In_Out_distribution/train_stratified.csv"
