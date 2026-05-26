@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "Starting AMC ECG pruning..."
+echo "Starting ECG pruning..."
 # bash scripts/run_search_mobilenetv2.sh
 # source ~/anaconda3/bin/activate your_env
 
