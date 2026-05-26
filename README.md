@@ -39,18 +39,28 @@ Reinforcement learning based structural channel pruning for lightweight multi-la
 ```text
 RL_ECG_Pruning/
 │
-├── mobilenetv2_search.py          # RL pruning search        
+├── mobilenetv2_search.py          # RL pruning search for MobileNetV2-1D
+├── seresnet18_search.py           # RL pruning search for SE-ResNet18-1D
+│
 ├── env/
-│   ├── ecg_channel_pruning_env.py
+│   └── ecg_channel_pruning_env.py # ECG channel pruning environment
+│
 ├── lib/
 │   ├── agent.py                   # DDPG agent
 │   ├── memory.py                  # Replay buffer
-│   └── utils.py
+│   └── utils.py                   # Utility functions
+│
 ├── scripts/
-│   ├── run_search.sh
+│   └── run_search.sh              # Example pruning search script
+│
 ├── src/
-│   ├── modeling/models/mobilenetv2.py
-│   └── dataloader/
+│   ├── modeling/
+│   │   └── models/
+│   │       ├── mobilenetv2.py     # MobileNetV2-1D model
+│   │       └── seresnet18.py      # SE-ResNet18-1D model
+│   │
+│   └── dataloader/                # ECG dataset and preprocessing
+│
 └── README.md
 ```
 
